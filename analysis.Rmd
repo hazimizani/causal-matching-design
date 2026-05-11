@@ -1,0 +1,361 @@
+---
+title: "Matching as Design: Recovering a Causal Effect from Observational Data"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+We use the **LaLonde dataset** to construct a matched design estimating the effect of a job training program (NSW) on 1978 earnings. The dataset contains 185 treated individuals who participated in the program and 429 controls drawn from the CPS (Current Population Survey). Because the experimental benchmark ATE is approximately \$1,794, we can evaluate how well our matching recovers the causal effect.
+
+```{r load-data}
+library(MatchIt)
+library(dplyr)
+data("lalonde")
+
+str(lalonde)
+```
+
+---
+
+# Part 1: Data and Confounder Justification
+
+## Summary Statistics by Treatment Group
+
+```{r summary-stats}
+# Overall dimensions
+cat("Total observations:", nrow(lalonde), "\n")
+cat("Treated:", sum(lalonde$treat == 1), "\n")
+cat("Control:", sum(lalonde$treat == 0), "\n\n")
+
+# Mean of each numeric variable by treatment group
+numeric_cols <- lalonde[, sapply(lalonde, is.numeric)]
+agg <- aggregate(. ~ treat, data = numeric_cols, FUN = mean)
+print(round(t(agg), 2))
+```
+
+```{r summary-table}
+# Nicer side-by-side table (exclude 'race' since it's a factor)
+covs <- c("age", "educ", "married", "nodegree", "re74", "re75", "re78")
+
+summary_table <- data.frame(
+  Variable = covs,
+  Treated_Mean = sapply(covs, function(v) mean(lalonde[lalonde$treat == 1, v])),
+  Control_Mean = sapply(covs, function(v) mean(lalonde[lalonde$treat == 0, v])),
+  Treated_SD = sapply(covs, function(v) sd(lalonde[lalonde$treat == 1, v])),
+  Control_SD = sapply(covs, function(v) sd(lalonde[lalonde$treat == 0, v]))
+)
+summary_table[, 2:5] <- round(summary_table[, 2:5], 2)
+rownames(summary_table) <- NULL
+print(summary_table)
+
+# Race distribution by treatment group
+cat("\nRace distribution (Treated):\n")
+print(table(lalonde$race[lalonde$treat == 1]))
+cat("\nRace distribution (Control):\n")
+print(table(lalonde$race[lalonde$treat == 0]))
+
+# Naive (unadjusted) difference in means
+naive_ate <- mean(lalonde$re78[lalonde$treat == 1]) - mean(lalonde$re78[lalonde$treat == 0])
+cat("\nNaive ATE (unadjusted):", round(naive_ate, 2), "\n")
+cat("Experimental benchmark: ~$1,794\n")
+cat("The negative naive estimate reflects selection bias — the program targeted\n")
+cat("disadvantaged workers who would have earned less regardless. Matching should\n")
+cat("recover an estimate closer to the experimental benchmark.\n")
+```
+
+## Pre-Matching Balance: SMDs and Variance Ratios
+
+```{r balance-diagnostics}
+# Standardized mean differences and variance ratios (pre-matching)
+smd_and_vr <- data.frame(
+  Variable = covs,
+  SMD = sapply(covs, function(v) {
+    m1 <- mean(lalonde[lalonde$treat == 1, v])
+    m0 <- mean(lalonde[lalonde$treat == 0, v])
+    s1 <- sd(lalonde[lalonde$treat == 1, v])
+    s0 <- sd(lalonde[lalonde$treat == 0, v])
+    (m1 - m0) / sqrt((s1^2 + s0^2) / 2)
+  }),
+  Variance_Ratio = sapply(covs, function(v) {
+    var(lalonde[lalonde$treat == 1, v]) / var(lalonde[lalonde$treat == 0, v])
+  })
+)
+smd_and_vr$SMD <- round(smd_and_vr$SMD, 3)
+smd_and_vr$Variance_Ratio <- round(smd_and_vr$Variance_Ratio, 3)
+rownames(smd_and_vr) <- NULL
+print(smd_and_vr)
+
+cat("\nGuidelines: |SMD| < 0.1 = excellent balance; variance ratio near 1 = similar spread\n")
+cat("Large SMDs on re74, re75, married, and age confirm substantial pre-matching imbalance.\n")
+```
+
+## Confounder Justification
+
+Each covariate below is a plausible confounder as it affects both the likelihood of enrolling in the training program and future earnings:
+
+- **age**: Older workers may be less likely to enroll in training and have different earnings trajectories.
+- **educ** (years of education): More educated individuals may self-select out of job training and earn more regardless.
+- **race**: Structural labor market disparities affect both program enrollment and wages.
+- **married**: Marital status correlates with labor market stability and may influence program eligibility or willingness to enroll.
+- **nodegree** (no high school diploma): Strongly predicts both eligibility for training programs and baseline earnings capacity.
+- **re74, re75** (prior earnings in 1974 and 1975): Direct measures of pre-treatment economic status. Low prior earnings predict both enrollment (programs target disadvantaged workers) and lower future earnings absentintervention.
+
+---
+
+# Part 2: Propensity Score Estimation and Overlap
+
+## Propensity Score Model
+
+We estimate the propensity score using logistic regression with all confounders:
+
+```{r ps-model}
+ps_model <- glm(treat ~ age + educ + race + married + nodegree + re74 + re75, data = lalonde, family = binomial)
+
+summary(ps_model)
+
+lalonde$ps <- predict(ps_model, type = "response")
+```
+
+## Propensity Score Distribution
+
+```{r ps-distribution, fig.width=8, fig.height=5}
+par(mfrow = c(1, 2))
+
+# Histograms
+hist(lalonde$ps[lalonde$treat == 1], breaks = 30, col = rgb(0.2, 0.5, 0.8, 0.6),
+     main = "Treated", xlab = "Propensity Score", xlim = c(0, 1))
+hist(lalonde$ps[lalonde$treat == 0], breaks = 30, col = rgb(0.8, 0.3, 0.3, 0.6),
+     main = "Control", xlab = "Propensity Score", xlim = c(0, 1))
+```
+
+```{r ps-overlap, fig.width=8, fig.height=5}
+# Side-by-side boxplot
+par(mfrow = c(1, 1))
+boxplot(ps ~ treat, data = lalonde,
+        names = c("Control", "Treated"),
+        xlab = "Group", ylab = "Propensity Score",
+        main = "Propensity Score Overlap",
+        col = c(rgb(0.8, 0.3, 0.3, 0.4), rgb(0.2, 0.5, 0.8, 0.4)))
+```
+
+## Overlap Assessment
+
+```{r overlap-stats}
+cat("Propensity score ranges:\n")
+cat("Treated:", round(range(lalonde$ps[lalonde$treat == 1]), 4), "\n")
+cat("Control:", round(range(lalonde$ps[lalonde$treat == 0]), 4), "\n\n")
+
+# Common support region
+common_min <- max(min(lalonde$ps[lalonde$treat == 1]), min(lalonde$ps[lalonde$treat == 0]))
+common_max <- min(max(lalonde$ps[lalonde$treat == 1]), max(lalonde$ps[lalonde$treat == 0]))
+cat("Common support: [", round(common_min, 4), ",", round(common_max, 4), "]\n")
+
+# How many units fall outside common support
+outside <- sum(lalonde$ps < common_min | lalonde$ps > common_max)
+cat("Units outside common support:", outside, "\n")
+```
+
+## Effective Sample Size
+
+```{r ess}
+# Under IPW, the effective sample size measures how many "equivalent" observations we effectively have after reweighting
+w1 <- 1 / lalonde$ps[lalonde$treat == 1]
+w0 <- 1 / (1 - lalonde$ps[lalonde$treat == 0])
+
+ess_treated <- sum(w1)^2 / sum(w1^2)
+ess_control <- sum(w0)^2 / sum(w0^2)
+
+cat("Effective sample size (treated):", round(ess_treated, 1),
+    "out of", sum(lalonde$treat == 1), "\n")
+cat("Effective sample size (control):", round(ess_control, 1),
+    "out of", sum(lalonde$treat == 0), "\n")
+cat("\nA large drop from nominal to effective sample size indicates\n")
+cat("extreme weights driven by poor overlap or near-zero propensity scores.\n")
+```
+
+## Propensity Score Distribution by Race
+
+```{r ps-by-race, fig.width=8, fig.height=5}
+# Race is the strongest predictor in the PS model — visualize how it
+# drives the separation between treated and control PS distributions
+boxplot(ps ~ race + treat, data = lalonde,
+        col = rep(c(rgb(0.8, 0.3, 0.3, 0.4), rgb(0.2, 0.5, 0.8, 0.4)), 3),
+        names = c("Black\nCtrl", "Black\nTrt", "Hispan\nCtrl", "Hispan\nTrt",
+                   "White\nCtrl", "White\nTrt"),
+        xlab = "", ylab = "Propensity Score",
+        main = "Propensity Score by Race and Treatment Status")
+```
+
+---
+
+# Part 3: Matching and Balance Diagnostics
+
+- Implement nearest-neighbor matching (with/without caliper) using `MatchIt`
+- Consider full matching or optimal matching as alternatives
+- Produce a Love plot showing standardized mean differences before and after matching
+- Create a balance table for the matched sample
+- Report the number of matched pairs and any dropped units
+
+
+## Nearest-neighbor match on propensity scores without caliper
+
+- Compute matches 
+
+```{r}
+# 1:1 NN PS matching 
+nn_ps_match <- matchit(treat ~ age + educ + race + married + 
+                    nodegree + re74 + re75,
+                  data = lalonde,
+                  method = "nearest",
+                  distance = "glm")
+
+summary(nn_ps_match, un = FALSE)
+```
+
+- Diagnostics 
+
+```{r}
+# SMD
+plot(summary(nn_ps_match))
+
+# PS
+plot(nn_ps_match, type = "jitter", interactive = FALSE)
+
+# variable distribution
+plot(nn_ps_match, type = "density", interactive = FALSE,
+     which.xs = ~age + married + re75) # set to only three variables so it would fit in a single plot
+```
+
+- ATE estimation
+
+```{r}
+nn_match_samples <- c(as.vector(nn_ps_match$match.matrix[,1]), rownames(nn_ps_match$match.matrix))
+
+df_nn_match <- lalonde[nn_match_samples,]
+Z <- df_nn_match$treat
+Y <- df_nn_match$re78
+
+ATE_nn_match <- mean(Y[Z==1]) - mean(Y[Z==0])
+
+cat("Estimated ATE NN without caliper: ", ATE_nn_match)
+```
+
+
+From 614 units, 244 were dropped when doing nearest-neighbor matching, leaving 185 matched pairs. This is due to the fact that there were only 185 treatment units, each of which was matched using 1:1 matching. Nearest-neighbor matching is not enough to balance the treatment and control units, which is shown by the large SMD found in matched pairs across covariates. This reflects in the poor ATE estimate (~\$894), which is significantly different that the true effect (~\$1,794).
+
+## Nearest-neighbor match on propensity scores with caliper (0.5 SD)
+
+- Compute matches 
+
+```{r}
+# match with caliper
+nn_calip_match <- matchit(treat ~ age + educ + race + married + 
+                    nodegree + re74 + re75,
+                  data = lalonde,
+                  method = "nearest",
+                  distance = "glm",
+                  caliper=0.5,
+                  std.caliper = TRUE)
+
+summary(nn_calip_match, un = FALSE)
+```
+
+- Diagnostics 
+
+```{r}
+# SMD
+plot(summary(nn_calip_match))
+
+# PS
+plot(nn_calip_match, type = "jitter", interactive = FALSE)
+
+# variable distribution
+plot(nn_calip_match, type = "density", interactive = FALSE,
+     which.xs = ~age + married + re75) # set to only three variables so it would fit in a single plot
+```
+
+
+- ATE estimation
+
+```{r}
+nn_calip_samples <- c(as.vector(nn_calip_match$match.matrix[,1]), rownames(nn_calip_match$match.matrix))
+
+nn_calip_samples <- nn_calip_samples[! is.na(nn_calip_samples)]
+df_nn_calip <- lalonde[nn_calip_samples,]
+Z <- df_nn_calip$treat
+Y <- df_nn_calip$re78
+
+ATE_nn_calip <- mean(Y[Z==1]) - mean(Y[Z==0])
+
+cat("Estimated ATE with caliper: ", ATE_nn_calip)
+```
+
+From 614 units, 368 were dropped when setting the caliper equal to $0.5\sigma_{PS}$, leaving 123 matched pairs. This significatly improved the ATE estimate (~\$1410) when compared to the nearest-neighbor matching without a caliper. This could be expected given the significant difference in the distribution of propensity scores across the two groups. The reduction of the sample size promoted by the caliper also assisted with better balance across covariates, as seen in the Love plots
+
+## Full matching
+
+- Compute matches 
+
+```{r}
+# match with caliper
+full_match <- matchit(treat ~ age + educ + race + married + 
+                    nodegree + re74 + re75,
+                  data = lalonde,
+                  method = "full",
+                  distance = "glm")
+
+summary(full_match, un = FALSE)
+```
+
+- Diagnostics 
+
+```{r}
+# SMD
+plot(summary(full_match))
+
+# PS
+plot(full_match, type = "jitter", interactive = FALSE)
+
+# variable distribution
+plot(full_match, type = "density", interactive = FALSE,
+     which.xs = ~age + married + re75) # set to only three variables so it would fit in a single plot
+```
+
+
+- ATE estimation
+
+```{r}
+# Extract dataframe with weights and add column containing weighted outcomes 
+full_match_df = match.data(full_match) %>% 
+  mutate(weighted_re78 = weights*re78)
+
+# Create vector with weighted treatment outcomes
+w_treatment_df = full_match_df %>% 
+  filter(treat == 1) 
+
+w_treatment_outcomes = w_treatment_df %>% 
+  pull(weighted_re78)
+
+# Create vector with weighted control outcomes
+w_control_df = full_match_df %>% 
+  filter(treat == 0)
+
+w_control_outcomes = w_control_df %>% 
+  pull(weighted_re78)
+  
+# Compute difference in mean weighted treatment and control outcomes
+ATE_full_match = mean(w_treatment_outcomes) - mean(w_control_outcomes)
+
+cat("Estimated ATE Full Match: ", ATE_full_match)
+```
+
+In the full-matched design, all 614 units were used and grouped into 105 strata. Each strata contains at least one treatment and control unit but unlike the other matched designs, groups can have varying numbers of each.
+
